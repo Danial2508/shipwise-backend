@@ -1,266 +1,227 @@
+import os
+from pathlib import Path
+from typing import List
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-import tempfile
-import json
-from datetime import datetime, timezone
+from firebase_admin import credentials, firestore, initialize_app, get_app
 
-app = FastAPI(title="SHIPWISE API", version="1.0")
+from document_reader import read_document
+from extractor import extract_fields, get_missing_fields
+from comparator import compare_documents
+
+app = FastAPI(title="SHIPWISE API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def init_firebase():
+    try:
+        get_app()
+        return True, None
+    except ValueError:
+        pass
 
-# ============================================================
-# FIRESTORE CONNECTION
-# Supports:
-# 1. Local serviceAccountKey.json
-# 2. Local firebase-service-account.json
-# 3. Render Secret File
-# 4. Google Cloud Application Default Credentials
-# ============================================================
+    for path in (
+        "/etc/secrets/serviceAccountKey.json",
+        "/etc/secrets/firebase-service-account.json",
+        str(Path(__file__).resolve().parent / "serviceAccountKey.json"),
+        str(Path(__file__).resolve().parent / "firebase-service-account.json"),
+    ):
+        if os.path.exists(path):
+            try:
+                initialize_app(credentials.Certificate(path))
+                return True, None
+            except Exception as exc:
+                return False, str(exc)
 
-db = None
-firestore_error = None
+    try:
+        initialize_app()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
+FIREBASE_OK, FIREBASE_ERROR = init_firebase()
 
-    key_candidates = [
-        Path(__file__).parent / "serviceAccountKey.json",
-        Path(__file__).parent / "firebase-service-account.json",
-        Path("/etc/secrets/serviceAccountKey.json"),
-        Path("/etc/secrets/firebase-service-account.json"),
-    ]
-
-    key = next((p for p in key_candidates if p.exists()), None)
-
-    if key:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(
-                credentials.Certificate(str(key))
-            )
-
-        db = firestore.client()
-
-    else:
-        # Try Application Default Credentials
-        # Useful for cloud environments such as Google Cloud.
-        try:
-            if not firebase_admin._apps:
-                firebase_admin.initialize_app()
-
-            db = firestore.client()
-
-        except Exception as e:
-            firestore_error = f"No Firebase credentials found: {e}"
-
-except Exception as e:
-    firestore_error = str(e)
-
-
-# ============================================================
-# ROOT
-# ============================================================
+def get_db():
+    if not FIREBASE_OK:
+        return None
+    try:
+        return firestore.client()
+    except Exception:
+        return None
 
 @app.get("/")
 def root():
     return {
         "service": "SHIPWISE API",
         "status": "running",
-        "firestore": db is not None,
+        "firestore": get_db() is not None,
     }
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 @app.get("/health")
 def health():
+    db = get_db()
     return {
-        "status": "ok",
+        "status": "healthy",
         "firestore": db is not None,
-        "firestore_error": firestore_error,
+        "firestore_error": None if db is not None else FIREBASE_ERROR,
     }
-
-
-# ============================================================
-# FIRESTORE STATUS
-# ============================================================
 
 @app.get("/firestore/status")
 def firestore_status():
-
+    db = get_db()
     if db is None:
-        return {
-            "connected": False,
-            "error": firestore_error,
-        }
-
+        return {"firestore": False, "error": FIREBASE_ERROR}
     try:
-        # Lightweight connectivity check
-        list(
-            db.collection("shipwise_results")
-            .limit(1)
-            .stream()
-        )
-
-        return {
-            "connected": True
-        }
-
-    except Exception as e:
-        return {
-            "connected": False,
-            "error": str(e)
-        }
-
-
-# ============================================================
-# GET RESULTS
-# ============================================================
+        list(db.collection("shipwise_results").limit(1).stream())
+        return {"firestore": True}
+    except Exception as exc:
+        return {"firestore": False, "error": str(exc)}
 
 @app.get("/results")
-def results(limit: int = 50):
-
+def get_results():
+    db = get_db()
     if db is None:
-        return {
-            "results": [],
-            "firestore": False,
-            "error": firestore_error
-        }
-
-    try:
-
-        docs = (
-            db.collection("shipwise_results")
-            .limit(limit)
-            .stream()
-        )
-
-        output = []
-
-        for doc in docs:
-
-            item = doc.to_dict()
-            item["id"] = doc.id
-
-            output.append(item)
-
-        return {
-            "results": output,
-            "firestore": True
-        }
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-# ============================================================
-# SAVE RESULT
-# ============================================================
-
-def save_result(result: dict):
-
-    if db is None:
-        return None
-
-    result = dict(result)
-
-    result["processed_at"] = (
-        datetime.now(timezone.utc).isoformat()
-    )
-
-    ref = (
-        db.collection("shipwise_results")
-        .document()
-    )
-
-    ref.set(result)
-
-    return ref.id
-
-
-# ============================================================
-# CREATE RESULT
-# ============================================================
+        return {"results": [], "firestore": False}
+    docs = db.collection("shipwise_results").stream()
+    results = []
+    for doc in docs:
+        item = doc.to_dict()
+        item["id"] = doc.id
+        results.append(item)
+    return {"results": results, "firestore": True}
 
 @app.post("/results")
-async def create_result(payload: dict):
+def save_result(payload: dict):
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Firestore unavailable")
+    from datetime import datetime, timezone
+    payload = dict(payload)
+    payload["created_at"] = datetime.now(timezone.utc).isoformat()
+    ref = db.collection("shipwise_results").document()
+    ref.set(payload)
+    return {"saved": True, "id": ref.id, "result": payload}
 
-    doc_id = save_result(payload)
+class UploadedInbox:
+    def __init__(self, files):
+        self.files = files
+
+    def read_bytes(self, attachment):
+        return self.files[attachment]
+
+    def read_text(self, attachment, encoding="utf-8"):
+        return self.files[attachment].decode(encoding, errors="replace")
+
+SUPPORTED_EXTENSIONS = {".txt", ".xlsx", ".docx", ".pdf"}
+
+def role(filename):
+    name = Path(filename).name.lower()
+    if "_si." in name or name.startswith("si.") or "shipping_instruction" in name:
+        return "si"
+    if "_bl." in name or name.startswith("bl.") or "bill_of_lading" in name:
+        return "bl"
+    return None
+
+def review_result(reason):
+    return {
+        "category": "BL_COMPARISON",
+        "status": "NEEDS_REVIEW",
+        "review_reason": reason,
+        "has_defect": False,
+        "defect_fields": [],
+    }
+
+@app.post("/process")
+async def process_documents(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    stored = {}
+    for upload in files:
+        filename = Path(upload.filename or "").name
+        suffix = Path(filename).suffix.lower()
+        if not filename:
+            continue
+        if suffix not in SUPPORTED_EXTENSIONS:
+            return {"result": review_result("wrong_doc_type"),
+                    "message": f"Unsupported document type: {suffix or 'unknown'}"}
+        data = await upload.read()
+        if not data:
+            return {"result": review_result("unreadable"),
+                    "message": f"Empty file: {filename}"}
+        stored[filename] = data
+
+    si_name = next((n for n in stored if role(n) == "si"), None)
+    bl_name = next((n for n in stored if role(n) == "bl"), None)
+
+    if si_name is None or bl_name is None:
+        return {
+            "result": review_result("missing_attachment"),
+            "message": "Upload one SI and one BL document. Filenames should contain _SI and _BL."
+        }
+
+    inbox = UploadedInbox(stored)
+
+    try:
+        si_text = read_document(inbox, si_name)
+        bl_text = read_document(inbox, bl_name)
+    except Exception as exc:
+        return {"result": review_result("unreadable"), "message": str(exc)}
+
+    si_fields = extract_fields(si_text)
+    bl_fields = extract_fields(bl_text)
+    si_missing = get_missing_fields(si_fields)
+    bl_missing = get_missing_fields(bl_fields)
+
+    if si_missing or bl_missing:
+        result = review_result("missing_value")
+        result.update({
+            "si_fields": si_fields,
+            "bl_fields": bl_fields,
+            "missing_si_fields": si_missing,
+            "missing_bl_fields": bl_missing,
+        })
+    else:
+        comparison = compare_documents(si_fields, bl_fields)
+        differences = comparison.get("differences", {})
+        if any(x.get("reason") == "missing_value" for x in differences.values()):
+            result = review_result("missing_value")
+            result.update({"si_fields": si_fields, "bl_fields": bl_fields})
+        else:
+            result = {
+                "category": "BL_COMPARISON",
+                "status": comparison["status"],
+                "review_reason": None,
+                "has_defect": comparison["has_defect"],
+                "defect_fields": comparison["defect_fields"],
+                "si_fields": si_fields,
+                "bl_fields": bl_fields,
+                "differences": differences,
+            }
+
+    db = get_db()
+    firestore_id = None
+    if db is not None:
+        from datetime import datetime, timezone
+        record = dict(result)
+        record["files"] = [si_name, bl_name]
+        record["created_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            ref = db.collection("shipwise_results").document()
+            ref.set(record)
+            firestore_id = ref.id
+        except Exception:
+            pass
 
     return {
-        "saved": doc_id is not None,
-        "id": doc_id,
-        "result": payload,
-    }
-
-
-# ============================================================
-# DOCUMENT UPLOAD
-# ============================================================
-
-@app.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...)
-):
-
-    suffix = Path(
-        file.filename or ""
-    ).suffix.lower()
-
-    allowed = {
-        ".txt",
-        ".pdf",
-        ".xlsx",
-        ".docx",
-        ".pptx"
-    }
-
-    if suffix not in allowed:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported file type: {suffix}. "
-                f"Allowed: {sorted(allowed)}"
-            )
-        )
-
-    data = await file.read()
-
-    # Current upload endpoint validates the document
-    # and stores an intake record.
-    #
-    # Existing 94.53% classification/extraction logic
-    # remains untouched.
-
-    intake = {
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "extension": suffix,
-        "size_bytes": len(data),
-        "status": "RECEIVED",
-    }
-
-    doc_id = save_result(intake)
-
-    return {
-        "success": True,
-        "message": "Document received.",
-        "firestore_saved": doc_id is not None,
-        "id": doc_id,
-        "file": intake,
+        "result": result,
+        "files": [si_name, bl_name],
+        "firestore_id": firestore_id,
     }
