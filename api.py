@@ -15,7 +15,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional Firestore connection.
+
+# ============================================================
+# FIRESTORE CONNECTION
+# Supports:
+# 1. Local serviceAccountKey.json
+# 2. Local firebase-service-account.json
+# 3. Render Secret File
+# 4. Google Cloud Application Default Credentials
+# ============================================================
+
 db = None
 firestore_error = None
 
@@ -26,19 +35,39 @@ try:
     key_candidates = [
         Path(__file__).parent / "serviceAccountKey.json",
         Path(__file__).parent / "firebase-service-account.json",
+        Path("/etc/secrets/serviceAccountKey.json"),
+        Path("/etc/secrets/firebase-service-account.json"),
     ]
 
     key = next((p for p in key_candidates if p.exists()), None)
 
     if key:
         if not firebase_admin._apps:
-            firebase_admin.initialize_app(credentials.Certificate(str(key)))
+            firebase_admin.initialize_app(
+                credentials.Certificate(str(key))
+            )
+
         db = firestore.client()
+
     else:
-        firestore_error = "No Firebase service account key found."
+        # Try Application Default Credentials
+        # Useful for cloud environments such as Google Cloud.
+        try:
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app()
+
+            db = firestore.client()
+
+        except Exception as e:
+            firestore_error = f"No Firebase credentials found: {e}"
+
 except Exception as e:
     firestore_error = str(e)
 
+
+# ============================================================
+# ROOT
+# ============================================================
 
 @app.get("/")
 def root():
@@ -49,6 +78,10 @@ def root():
     }
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/health")
 def health():
     return {
@@ -58,8 +91,13 @@ def health():
     }
 
 
+# ============================================================
+# FIRESTORE STATUS
+# ============================================================
+
 @app.get("/firestore/status")
 def firestore_status():
+
     if db is None:
         return {
             "connected": False,
@@ -67,45 +105,102 @@ def firestore_status():
         }
 
     try:
-        # Lightweight connectivity check.
-        list(db.collection("shipwise_results").limit(1).stream())
-        return {"connected": True}
-    except Exception as e:
-        return {"connected": False, "error": str(e)}
+        # Lightweight connectivity check
+        list(
+            db.collection("shipwise_results")
+            .limit(1)
+            .stream()
+        )
 
+        return {
+            "connected": True
+        }
+
+    except Exception as e:
+        return {
+            "connected": False,
+            "error": str(e)
+        }
+
+
+# ============================================================
+# GET RESULTS
+# ============================================================
 
 @app.get("/results")
 def results(limit: int = 50):
+
     if db is None:
-        return {"results": [], "firestore": False, "error": firestore_error}
+        return {
+            "results": [],
+            "firestore": False,
+            "error": firestore_error
+        }
 
     try:
-        docs = db.collection("shipwise_results").limit(limit).stream()
+
+        docs = (
+            db.collection("shipwise_results")
+            .limit(limit)
+            .stream()
+        )
+
         output = []
+
         for doc in docs:
+
             item = doc.to_dict()
             item["id"] = doc.id
-            output.append(item)
-        return {"results": output, "firestore": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
+            output.append(item)
+
+        return {
+            "results": output,
+            "firestore": True
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# ============================================================
+# SAVE RESULT
+# ============================================================
 
 def save_result(result: dict):
+
     if db is None:
         return None
 
     result = dict(result)
-    result["processed_at"] = datetime.now(timezone.utc).isoformat()
 
-    ref = db.collection("shipwise_results").document()
+    result["processed_at"] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+
+    ref = (
+        db.collection("shipwise_results")
+        .document()
+    )
+
     ref.set(result)
+
     return ref.id
 
 
+# ============================================================
+# CREATE RESULT
+# ============================================================
+
 @app.post("/results")
 async def create_result(payload: dict):
+
     doc_id = save_result(payload)
+
     return {
         "saved": doc_id is not None,
         "id": doc_id,
@@ -113,21 +208,45 @@ async def create_result(payload: dict):
     }
 
 
-@app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    suffix = Path(file.filename or "").suffix.lower()
+# ============================================================
+# DOCUMENT UPLOAD
+# ============================================================
 
-    allowed = {".txt", ".pdf", ".xlsx", ".docx", ".pptx"}
+@app.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...)
+):
+
+    suffix = Path(
+        file.filename or ""
+    ).suffix.lower()
+
+    allowed = {
+        ".txt",
+        ".pdf",
+        ".xlsx",
+        ".docx",
+        ".pptx"
+    }
+
     if suffix not in allowed:
+
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {suffix}. Allowed: {sorted(allowed)}"
+            detail=(
+                f"Unsupported file type: {suffix}. "
+                f"Allowed: {sorted(allowed)}"
+            )
         )
 
     data = await file.read()
 
-    # This endpoint validates upload and stores an intake record.
-    # Existing 94.53% classification/extraction logic remains untouched.
+    # Current upload endpoint validates the document
+    # and stores an intake record.
+    #
+    # Existing 94.53% classification/extraction logic
+    # remains untouched.
+
     intake = {
         "filename": file.filename,
         "content_type": file.content_type,
